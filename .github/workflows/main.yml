@@ -1,0 +1,113 @@
+Tên: RDP
+ 
+TRÊN:
+  workflow_dispatch:
+ 
+việc làm:
+  secure-rdp:
+    chạy trên: windows-latest
+    thời gian chờ tính bằng phút: 3600
+ 
+    các bước:
+      - Tên: Cấu hình cài đặt RDP cốt lõi
+        chạy: |
+          # Kích hoạt tính năng Truy cập Máy tính Từ xa và tắt Xác thực Cấp độ Mạng (nếu cần)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Tên "fDenyTSConnections" -Giá trị 0 -Buộc
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Tên "UserAuthentication" -Giá trị 0 -Buộc
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Tên "SecurityLayer" -Giá trị 0 -Buộc
+ 
+          # Xóa bất kỳ quy tắc hiện có nào có cùng tên để tránh trùng lặp
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+ 
+          # Để kiểm tra, hãy cho phép mọi kết nối đến trên cổng 3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+ 
+          # (Tùy chọn) Khởi động lại dịch vụ Máy tính từ xa để đảm bảo các thay đổi có hiệu lực
+          Restart-Service -Name TermService -Force
+ 
+      - Tên: Tạo người dùng RDP với mật khẩu bảo mật
+        chạy: |
+          Add-Type -AssemblyName System.Security
+          $charSet = @{
+              Upper = [char[]](65..90) # AZ
+              Hạ = [char[]](97..122) # az
+              Số = [char[]](48..57) # 0-9
+              Đặc biệt = ([char[]](33..47) + [char[]](58..64) +
+                         [char[]](91..96) + [char[]](123..126)) # Ký tự đặc biệt
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+ 
+          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+ 
+          nếu (-không (Get-LocalUser -Name "RDP")) {
+              Lỗi ghi "Tạo người dùng thất bại"
+              lối ra 1
+          }
+ 
+      - Tên: Cài đặt Tailscale
+        chạy: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+ 
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+ 
+      - Tên: Thiết lập kết nối quy mô đuôi
+        chạy: |
+          # Khởi động Tailscale với khóa xác thực được cung cấp và thiết lập một tên máy chủ duy nhất
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+ 
+          # Chờ Tailscale cấp phát địa chỉ IP
+          $tsIP = $null
+          $retries = 0
+          trong khi (-không $tsIP -và $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Bắt đầu - Ngủ - Giây 5
+              $retries++
+          }
+ 
+                    nếu (-không phải $tsIP) {
+              Lỗi ghi "Địa chỉ IP của Tailscale chưa được gán. Đang thoát."
+              lối ra 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+ 
+      - Tên: Xác minh khả năng truy cập RDP
+        chạy: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+ 
+          # Kiểm tra kết nối bằng lệnh Test-NetConnection đối với địa chỉ IP của Tailscale trên cổng 3389
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          nếu (-not $testResult.TcpTestSucceeded) {
+              Lỗi ghi "Kết nối TCP đến cổng RDP 3389 không thành công"
+              lối ra 1
+          }
+          Write-Host "Kết nối TCP thành công!"
+ 
+      - Tên: Duy trì kết nối
+        chạy: |
+          Write-Host "`n=== TRUY CẬP RDP ==="
+          Write-Host "Địa chỉ: $env:TAILSCALE_IP"
+          Write-Host "Tên người dùng: RDP"
+          Write-Host "Mật khẩu: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+ 
+          # Giữ cho trình chạy hoạt động vô thời hạn (hoặc cho đến khi bị hủy thủ công)
+          trong khi ($true) {
+              Write-Host "[$(Get-Date)] RDP đang hoạt động - Sử dụng Ctrl+C trong quy trình làm việc để chấm dứt"
+              Bắt đầu - Ngủ - Giây 300
+          }
